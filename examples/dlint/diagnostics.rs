@@ -16,22 +16,33 @@ pub fn display_diagnostics(
 
 fn print_compact(diagnostics: &[LintDiagnostic]) {
   for diagnostic in diagnostics {
-    let display_index = diagnostic
-      .text_info
-      .line_and_column_display(diagnostic.range.start);
-    eprintln!(
-      "{}: line {}, col {}, Error - {} ({})",
-      diagnostic.specifier,
-      display_index.line_number,
-      display_index.column_number,
-      diagnostic.message,
-      diagnostic.code
-    )
+    match &diagnostic.range {
+      Some(range) => {
+        let display_index =
+          range.text_info.line_and_column_display(range.range.start);
+        eprintln!(
+          "{}: line {}, col {}, Error - {} ({})",
+          diagnostic.specifier,
+          display_index.line_number,
+          display_index.column_number,
+          diagnostic.details.message,
+          diagnostic.details.code
+        )
+      }
+      None => {
+        eprintln!(
+          "{}: {} ({})",
+          diagnostic.specifier,
+          diagnostic.message(),
+          diagnostic.code()
+        )
+      }
+    }
   }
 }
 
 fn print_pretty(diagnostics: &[LintDiagnostic]) {
   for diagnostic in diagnostics {
-    eprintln!("{}", diagnostic.display());
+    eprintln!("{}\n", diagnostic.display());
   }
 }

@@ -1,50 +1,106 @@
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
 use crate::control_flow::ControlFlow;
-use crate::diagnostic::{LintDiagnostic, LintFix};
+use crate::diagnostic::{
+  LintDiagnostic, LintDiagnosticDetails, LintDiagnosticRange, LintFix,
+};
 use crate::ignore_directives::{
   parse_line_ignore_directives, CodeStatus, FileIgnoreDirective,
   LineIgnoreDirective,
 };
 use crate::linter::LinterContext;
-use crate::rules::{self, get_all_rules, LintRule};
+use crate::rules::{self, LintRule};
+use deno_ast::swc::ast::Expr;
 use deno_ast::swc::common::comments::Comment;
-use deno_ast::swc::common::SyntaxContext;
-use deno_ast::Scope;
+use deno_ast::swc::common::util::take::Take;
+use deno_ast::swc::common::{SourceMap, SyntaxContext};
 use deno_ast::SourceTextInfo;
 use deno_ast::{
   view as ast_view, ParsedSource, RootNode, SourcePos, SourceRange,
 };
 use deno_ast::{MediaType, ModuleSpecifier};
+use deno_ast::{MultiThreadedComments, Scope};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// `Context` stores all data needed to perform linting of a particular file.
-pub struct Context<'view> {
+pub struct Context<'a> {
   parsed_source: ParsedSource,
   diagnostics: Vec<LintDiagnostic>,
-  program: ast_view::Program<'view>,
+  program: ast_view::Program<'a>,
   file_ignore_directive: Option<FileIgnoreDirective>,
   line_ignore_directives: HashMap<usize, LineIgnoreDirective>,
   scope: Scope,
   control_flow: ControlFlow,
   traverse_flow: TraverseFlow,
+  all_rule_codes: &'a HashSet<&'static str>,
   check_unknown_rules: bool,
+  #[allow(clippy::redundant_allocation)] // This type comes from SWC.
+  jsx_factory: Option<Arc<Box<Expr>>>,
+  #[allow(clippy::redundant_allocation)] // This type comes from SWC.
+  jsx_fragment_factory: Option<Arc<Box<Expr>>>,
 }
 
-impl<'view> Context<'view> {
+impl<'a> Context<'a> {
   pub(crate) fn new(
-    linter_ctx: &LinterContext,
+    linter_ctx: &'a LinterContext,
     parsed_source: ParsedSource,
-    program: ast_view::Program<'view>,
+    program: ast_view::Program<'a>,
     file_ignore_directive: Option<FileIgnoreDirective>,
+    default_jsx_factory: Option<String>,
+    default_jsx_fragment_factory: Option<String>,
   ) -> Self {
     let line_ignore_directives = parse_line_ignore_directives(
-      &linter_ctx.ignore_diagnostic_directive,
+      linter_ctx.ignore_diagnostic_directive,
       program,
     );
     let scope = Scope::analyze(program);
     let control_flow =
       ControlFlow::analyze(program, parsed_source.unresolved_context());
+
+    let mut jsx_factory = None;
+    let mut jsx_fragment_factory = None;
+
+    parsed_source.globals().with(|marks| {
+      let top_level_mark = marks.top_level;
+
+      if let Some(leading_comments) = parsed_source.get_leading_comments() {
+        let jsx_directives =
+          deno_ast::swc::transforms::react::JsxDirectives::from_comments(
+            &SourceMap::default(),
+            #[allow(clippy::disallowed_types)]
+            deno_ast::swc::common::Span::dummy(),
+            leading_comments,
+            top_level_mark,
+          );
+
+        jsx_factory = jsx_directives.pragma;
+        jsx_fragment_factory = jsx_directives.pragma_frag;
+      }
+
+      if jsx_factory.is_none() {
+        if let Some(factory) = default_jsx_factory {
+          jsx_factory =
+            Some(deno_ast::swc::transforms::react::parse_expr_for_jsx(
+              &SourceMap::default(),
+              "jsx",
+              factory,
+              top_level_mark,
+            ));
+        }
+      }
+      if jsx_fragment_factory.is_none() {
+        if let Some(factory) = default_jsx_fragment_factory {
+          jsx_fragment_factory =
+            Some(deno_ast::swc::transforms::react::parse_expr_for_jsx(
+              &SourceMap::default(),
+              "jsxFragment",
+              factory,
+              top_level_mark,
+            ));
+        }
+      }
+    });
 
     Self {
       file_ignore_directive,
@@ -56,6 +112,9 @@ impl<'view> Context<'view> {
       diagnostics: Vec::new(),
       traverse_flow: TraverseFlow::default(),
       check_unknown_rules: linter_ctx.check_unknown_rules,
+      all_rule_codes: &linter_ctx.all_rule_codes,
+      jsx_factory,
+      jsx_fragment_factory,
     }
   }
 
@@ -70,19 +129,29 @@ impl<'view> Context<'view> {
     self.parsed_source.media_type()
   }
 
+  /// Comment collection.
+  pub fn comments(&self) -> &MultiThreadedComments {
+    self.parsed_source.comments()
+  }
+
   /// Stores diagnostics that are generated while linting
   pub fn diagnostics(&self) -> &[LintDiagnostic] {
     &self.diagnostics
   }
 
+  /// Parsed source of the program.
+  pub fn parsed_source(&self) -> &ParsedSource {
+    &self.parsed_source
+  }
+
   /// Information about the file text.
   pub fn text_info(&self) -> &SourceTextInfo {
-    self.parsed_source.text_info()
+    self.parsed_source.text_info_lazy()
   }
 
   /// The AST view of the program, which for example can be used for getting
   /// comments
-  pub fn program(&self) -> ast_view::Program<'view> {
+  pub fn program(&self) -> ast_view::Program<'a> {
     self.program
   }
 
@@ -107,6 +176,22 @@ impl<'view> Context<'view> {
     &self.control_flow
   }
 
+  /// Get the JSX factory expression for this file, if one is specified (via
+  /// pragma or using a default). If this file is not JSX, uses the automatic
+  /// transform, or the default factory is not specified, this will return
+  /// `None`.
+  pub fn jsx_factory(&self) -> Option<Arc<Box<Expr>>> {
+    self.jsx_factory.clone()
+  }
+
+  /// Get the JSX fragment factory expression for this file, if one is specified
+  /// (via pragma or using a default). If this file is not JSX, uses the
+  /// automatic transform, or the default factory is not specified, this will
+  /// return `None`.
+  pub fn jsx_fragment_factory(&self) -> Option<Arc<Box<Expr>>> {
+    self.jsx_fragment_factory.clone()
+  }
+
   /// The `SyntaxContext` of any unresolved identifiers
   pub(crate) fn unresolved_ctxt(&self) -> SyntaxContext {
     self.parsed_source.unresolved_context()
@@ -124,21 +209,21 @@ impl<'view> Context<'view> {
     self.traverse_flow.set_stop_traverse();
   }
 
-  pub fn all_comments(&self) -> impl Iterator<Item = &'view Comment> {
+  pub fn all_comments(&self) -> impl Iterator<Item = &'a Comment> {
     self.program.comment_container().all_comments()
   }
 
   pub fn leading_comments_at(
     &self,
     start: SourcePos,
-  ) -> impl Iterator<Item = &'view Comment> {
+  ) -> impl Iterator<Item = &'a Comment> {
     self.program.comment_container().leading_comments(start)
   }
 
   pub fn trailing_comments_at(
     &self,
     end: SourcePos,
-  ) -> impl Iterator<Item = &'view Comment> {
+  ) -> impl Iterator<Item = &'a Comment> {
     self.program.comment_container().trailing_comments(end)
   }
 
@@ -151,18 +236,20 @@ impl<'view> Context<'view> {
 
     for diagnostic in self.diagnostics.iter().cloned() {
       if let Some(f) = self.file_ignore_directive.as_mut() {
-        if f.check_used(&diagnostic.code) {
+        if f.check_used(&diagnostic.details.code) {
           continue;
         }
       }
+      let Some(range) = diagnostic.range.as_ref() else {
+        continue;
+      };
 
-      let diagnostic_line =
-        diagnostic.text_info.line_index(diagnostic.range.start);
+      let diagnostic_line = range.text_info.line_index(range.range.start);
       if diagnostic_line > 0 {
         if let Some(l) =
           self.line_ignore_directives.get_mut(&(diagnostic_line - 1))
         {
-          if l.check_used(&diagnostic.code) {
+          if l.check_used(&diagnostic.details.code) {
             continue;
           }
         }
@@ -179,7 +266,7 @@ impl<'view> Context<'view> {
   /// works for diagnostics reported by other rules.
   pub(crate) fn ban_unused_ignore(
     &self,
-    specified_rules: &[&'static dyn LintRule],
+    specified_rules: &[Box<dyn LintRule>],
   ) -> Vec<LintDiagnostic> {
     const CODE: &str = "ban-unused-ignore";
 
@@ -207,11 +294,13 @@ impl<'view> Context<'view> {
         file_ignore.codes().iter().filter(is_unused_code)
       {
         let d = self.create_diagnostic(
-          file_ignore.range(),
-          CODE,
-          format!("Ignore for code \"{}\" was not used.", unused_code),
-          None,
-          Vec::new(),
+          Some(self.create_diagnostic_range(file_ignore.range())),
+          self.create_diagnostic_details(
+            CODE,
+            format!("Ignore for code \"{}\" was not used.", unused_code),
+            None,
+            Vec::new(),
+          ),
         );
         diagnostics.push(d);
       }
@@ -226,11 +315,13 @@ impl<'view> Context<'view> {
         line_ignore.codes().iter().filter(is_unused_code)
       {
         let d = self.create_diagnostic(
-          line_ignore.range(),
-          CODE,
-          format!("Ignore for code \"{}\" was not used.", unused_code),
-          None,
-          Vec::new(),
+          Some(self.create_diagnostic_range(line_ignore.range())),
+          self.create_diagnostic_details(
+            CODE,
+            format!("Ignore for code \"{}\" was not used.", unused_code),
+            None,
+            Vec::new(),
+          ),
         );
         diagnostics.push(d);
       }
@@ -244,10 +335,8 @@ impl<'view> Context<'view> {
   /// Lint rule implementation for `ban-unknown-rule-code`.
   /// This should be run after all normal rules.
   pub(crate) fn ban_unknown_rule_code(&mut self) -> Vec<LintDiagnostic> {
-    let builtin_all_rule_codes: HashSet<&'static str> =
-      get_all_rules().iter().map(|r| r.code()).collect();
     let is_unknown_rule =
-      |code: &&String| !builtin_all_rule_codes.contains(code.as_str());
+      |code: &&String| !self.all_rule_codes.contains(code.as_str());
 
     let mut diagnostics = Vec::new();
 
@@ -256,11 +345,13 @@ impl<'view> Context<'view> {
         file_ignore.codes().keys().filter(is_unknown_rule)
       {
         let d = self.create_diagnostic(
-          file_ignore.range(),
-          rules::ban_unknown_rule_code::CODE,
-          format!("Unknown rule for code \"{}\"", unknown_rule_code),
-          None,
-          Vec::new(),
+          Some(self.create_diagnostic_range(file_ignore.range())),
+          self.create_diagnostic_details(
+            rules::ban_unknown_rule_code::CODE,
+            format!("Unknown rule for code \"{}\"", unknown_rule_code),
+            None,
+            Vec::new(),
+          ),
         );
         diagnostics.push(d);
       }
@@ -271,11 +362,13 @@ impl<'view> Context<'view> {
         line_ignore.codes().keys().filter(is_unknown_rule)
       {
         let d = self.create_diagnostic(
-          line_ignore.range(),
-          rules::ban_unknown_rule_code::CODE,
-          format!("Unknown rule for code \"{}\"", unknown_rule_code),
-          None,
-          Vec::new(),
+          Some(self.create_diagnostic_range(line_ignore.range())),
+          self.create_diagnostic_details(
+            rules::ban_unknown_rule_code::CODE,
+            format!("Unknown rule for code \"{}\"", unknown_rule_code),
+            None,
+            Vec::new(),
+          ),
         );
         diagnostics.push(d);
       }
@@ -305,14 +398,15 @@ impl<'view> Context<'view> {
     code: impl ToString,
     message: impl ToString,
   ) {
-    let diagnostic = self.create_diagnostic(
-      range,
-      code.to_string(),
-      message.to_string(),
-      None,
-      Vec::new(),
+    self.add_diagnostic_details(
+      Some(self.create_diagnostic_range(range)),
+      self.create_diagnostic_details(
+        code,
+        message.to_string(),
+        None,
+        Vec::new(),
+      ),
     );
-    self.diagnostics.push(diagnostic);
   }
 
   pub fn add_diagnostic_with_hint(
@@ -322,14 +416,15 @@ impl<'view> Context<'view> {
     message: impl ToString,
     hint: impl ToString,
   ) {
-    let diagnostic = self.create_diagnostic(
-      range,
-      code,
-      message,
-      Some(hint.to_string()),
-      Vec::new(),
+    self.add_diagnostic_details(
+      Some(self.create_diagnostic_range(range)),
+      self.create_diagnostic_details(
+        code,
+        message,
+        Some(hint.to_string()),
+        Vec::new(),
+      ),
     );
-    self.diagnostics.push(diagnostic);
   }
 
   pub fn add_diagnostic_with_fixes(
@@ -340,26 +435,59 @@ impl<'view> Context<'view> {
     hint: Option<String>,
     fixes: Vec<LintFix>,
   ) {
-    let diagnostic = self.create_diagnostic(range, code, message, hint, fixes);
-    self.diagnostics.push(diagnostic);
+    self.add_diagnostic_details(
+      Some(self.create_diagnostic_range(range)),
+      self.create_diagnostic_details(code, message, hint, fixes),
+    );
+  }
+
+  pub fn add_diagnostic_details(
+    &mut self,
+    maybe_range: Option<LintDiagnosticRange>,
+    details: LintDiagnosticDetails,
+  ) {
+    self
+      .diagnostics
+      .push(self.create_diagnostic(maybe_range, details));
   }
 
   pub(crate) fn create_diagnostic(
     &self,
-    range: SourceRange,
+    maybe_range: Option<LintDiagnosticRange>,
+    details: LintDiagnosticDetails,
+  ) -> LintDiagnostic {
+    LintDiagnostic {
+      specifier: self.specifier().clone(),
+      range: maybe_range,
+      details,
+    }
+  }
+
+  pub(crate) fn create_diagnostic_details(
+    &self,
     code: impl ToString,
     message: impl ToString,
     maybe_hint: Option<String>,
     fixes: Vec<LintFix>,
-  ) -> LintDiagnostic {
-    LintDiagnostic {
-      specifier: self.specifier().clone(),
-      range,
-      text_info: self.text_info().clone(),
+  ) -> LintDiagnosticDetails {
+    LintDiagnosticDetails {
       message: message.to_string(),
       code: code.to_string(),
       hint: maybe_hint,
       fixes,
+      custom_docs_url: None,
+      info: vec![],
+    }
+  }
+
+  pub(crate) fn create_diagnostic_range(
+    &self,
+    range: SourceRange,
+  ) -> LintDiagnosticRange {
+    LintDiagnosticRange {
+      range,
+      text_info: self.text_info().clone(),
+      description: None,
     }
   }
 }

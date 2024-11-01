@@ -5,14 +5,19 @@ use anyhow::Error as AnyError;
 use clap::Arg;
 use clap::Command;
 use core::panic;
+use deno_ast::diagnostics::Diagnostic;
 use deno_ast::MediaType;
 use deno_ast::ModuleSpecifier;
+use deno_lint::linter::LintConfig;
 use deno_lint::linter::LintFileOptions;
-use deno_lint::linter::LinterBuilder;
-use deno_lint::rules::{get_filtered_rules, get_recommended_rules};
+use deno_lint::linter::Linter;
+use deno_lint::linter::LinterOptions;
+use deno_lint::rules::get_all_rules;
+use deno_lint::rules::{filtered_rules, recommended_rules};
 use log::debug;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -83,44 +88,65 @@ fn run_linter(
 
   let error_counts = Arc::new(AtomicUsize::new(0));
 
+  let all_rules = get_all_rules();
+  let all_rule_codes = all_rules
+    .iter()
+    .map(|rule| rule.code())
+    .collect::<HashSet<_>>();
   let rules = if let Some(config) = maybe_config {
     config.get_rules()
   } else if let Some(rule_name) = filter_rule_name {
     let include = vec![rule_name.to_string()];
-    get_filtered_rules(Some(vec![]), None, Some(include))
+    filtered_rules(get_all_rules(), Some(vec![]), None, Some(include))
   } else {
-    get_recommended_rules()
+    recommended_rules(get_all_rules())
   };
-  let file_diagnostics = Arc::new(Mutex::new(BTreeMap::new()));
-  let linter_builder = LinterBuilder::default().rules(rules.clone());
-
-  let linter = linter_builder.build();
   if rules.is_empty() {
     bail!("No lint rules configured");
   } else {
     debug!("Configured rules: {}", rules.len());
   }
+  let file_diagnostics = Arc::new(Mutex::new(BTreeMap::new()));
+  let linter = Linter::new(LinterOptions {
+    rules,
+    all_rule_codes,
+    custom_ignore_file_directive: None,
+    custom_ignore_diagnostic_directive: None,
+  });
 
   paths
     .par_iter()
     .try_for_each(|file_path| -> Result<(), AnyError> {
       let source_code = std::fs::read_to_string(file_path)?;
 
-      let (_parsed_source, diagnostics) =
-        linter.lint_file(LintFileOptions {
-          specifier: ModuleSpecifier::from_file_path(file_path).unwrap_or_else(
-            |_| {
-              panic!(
-                "Failed to convert path to module specifier: {}",
-                file_path.display()
-              )
-            },
-          ),
-          source_code,
-          media_type: MediaType::from_path(file_path),
-        })?;
+      let (parsed_source, diagnostics) = linter.lint_file(LintFileOptions {
+        specifier: ModuleSpecifier::from_file_path(file_path).unwrap_or_else(
+          |_| {
+            panic!(
+              "Failed to convert path to module specifier: {}",
+              file_path.display()
+            )
+          },
+        ),
+        source_code,
+        media_type: MediaType::from_path(file_path),
+        config: LintConfig {
+          default_jsx_factory: Some("React.createElement".to_string()),
+          default_jsx_fragment_factory: Some("React.Fragment".to_string()),
+        },
+      })?;
 
-      error_counts.fetch_add(diagnostics.len(), Ordering::Relaxed);
+      let mut number_of_errors = diagnostics.len();
+      if !parsed_source.diagnostics().is_empty() {
+        number_of_errors += parsed_source.diagnostics().to_vec().len();
+        parsed_source.diagnostics().to_vec().iter().for_each(
+          |parsing_diagnostic| {
+            eprintln!("{}", parsing_diagnostic.display());
+          },
+        );
+      }
+
+      error_counts.fetch_add(number_of_errors, Ordering::Relaxed);
 
       let mut lock = file_diagnostics.lock().unwrap();
 

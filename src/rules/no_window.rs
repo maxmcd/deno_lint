@@ -16,8 +16,7 @@ use if_chain::if_chain;
 pub struct NoWindow;
 
 const CODE: &str = "no-window";
-const MESSAGE: &str =
-  "window is deprecated and scheduled for removal in Deno 2.0";
+const MESSAGE: &str = "Window is no longer available in Deno";
 const HINT: &str = "Instead, use `globalThis`";
 const FIX_DESC: &str = "Rename window to globalThis";
 
@@ -66,10 +65,6 @@ impl NoWindowGlobalHandler {
 
 impl Handler for NoWindowGlobalHandler {
   fn member_expr(&mut self, expr: &ast_view::MemberExpr, ctx: &mut Context) {
-    if expr.parent().is::<ast_view::MemberExpr>() {
-      return;
-    }
-
     use deno_ast::view::Expr;
     if_chain! {
       if let Expr::Ident(ident) = &expr.obj;
@@ -159,6 +154,12 @@ function foo() {
   return window;
 }
 globalThis;"),
+        }
+      ],
+      r#"window.console.log()"#: [
+        {
+          col: 0,
+          fix: (FIX_DESC, "globalThis.console.log()"),
         }
       ],
     };

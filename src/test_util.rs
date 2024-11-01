@@ -2,8 +2,11 @@
 
 use crate::ast_parser;
 use crate::diagnostic::LintDiagnostic;
+use crate::linter::LintConfig;
 use crate::linter::LintFileOptions;
-use crate::linter::LinterBuilder;
+use crate::linter::Linter;
+use crate::linter::LinterOptions;
+use crate::rules::get_all_rules;
 use crate::rules::LintRule;
 use deno_ast::diagnostics::Diagnostic;
 use deno_ast::view as ast_view;
@@ -22,7 +25,7 @@ macro_rules! assert_lint_ok {
     $(,)?
   ) => {
     $(
-      $crate::test_util::assert_lint_ok(&$rule, $src, $filename);
+      $crate::test_util::assert_lint_ok(Box::new($rule), $src, $filename);
     )*
   };
   ($rule:expr, $($src:literal),+ $(,)?) => {
@@ -45,7 +48,7 @@ macro_rules! assert_lint_err {
     $(
       let errors = parse_err_test!($test);
       let tester = $crate::test_util::LintErrTester::new(
-        &$rule,
+        Box::new($rule),
         $src,
         errors,
         $filename,
@@ -76,7 +79,7 @@ macro_rules! assert_lint_err {
     $(
       let errors = parse_err_test!($message, $hint, $test);
       let tester = $crate::test_util::LintErrTester::new(
-        &$rule,
+        Box::new($rule),
         $src,
         errors,
         $filename,
@@ -179,12 +182,12 @@ pub struct LintErrTester {
   src: &'static str,
   errors: Vec<LintErr>,
   filename: &'static str,
-  rule: &'static dyn LintRule,
+  rule: Box<dyn LintRule>,
 }
 
 impl LintErrTester {
   pub fn new(
-    rule: &'static dyn LintRule,
+    rule: Box<dyn LintRule>,
     src: &'static str,
     errors: Vec<LintErr>,
     filename: &'static str,
@@ -206,7 +209,7 @@ impl LintErrTester {
         "Actual diagnostics:\n{:#?}",
         diagnostics
           .iter()
-          .map(|d| d.message.to_string())
+          .map(|d| d.details.message.to_string())
           .collect::<Vec<_>>()
       );
       assert_eq!(
@@ -236,7 +239,7 @@ impl LintErrTester {
         message,
         hint.as_deref(),
         fixes,
-        parsed_source.text_info(),
+        parsed_source.text_info_lazy(),
       );
     }
   }
@@ -314,11 +317,19 @@ impl LintErrBuilder {
 
 #[track_caller]
 fn lint(
-  rule: &'static dyn LintRule,
+  rule: Box<dyn LintRule>,
   source: &str,
   specifier: &str,
 ) -> (ParsedSource, Vec<LintDiagnostic>) {
-  let linter = LinterBuilder::default().rules(vec![rule]).build();
+  let linter = Linter::new(LinterOptions {
+    rules: vec![rule],
+    all_rule_codes: get_all_rules()
+      .into_iter()
+      .map(|rule| rule.code())
+      .collect(),
+    custom_ignore_diagnostic_directive: None,
+    custom_ignore_file_directive: None,
+  });
 
   let specifier = ModuleSpecifier::parse(specifier).unwrap();
   let media_type = MediaType::from_specifier(&specifier);
@@ -326,6 +337,10 @@ fn lint(
     specifier,
     source_code: source.to_string(),
     media_type,
+    config: LintConfig {
+      default_jsx_factory: Some("React.createElement".to_owned()),
+      default_jsx_fragment_factory: Some("React.Fragment".to_owned()),
+    },
   });
   match lint_result {
     Ok((source, diagnostics)) => (source, diagnostics),
@@ -343,10 +358,11 @@ pub fn assert_diagnostic(
   col: usize,
   source: &str,
 ) {
-  let line_and_column = diagnostic
+  let diagnostic_range = diagnostic.range.as_ref().unwrap();
+  let line_and_column = diagnostic_range
     .text_info
-    .line_and_column_index(diagnostic.range.start);
-  if diagnostic.code == code
+    .line_and_column_index(diagnostic_range.range.start);
+  if diagnostic.details.code == code
     // todo(dsherret): we should change these to be consistent (ex. both 1-indexed)
     && line_and_column.line_index + 1 == line
     && line_and_column.column_index == col
@@ -355,7 +371,7 @@ pub fn assert_diagnostic(
   }
   panic!(
     "expect diagnostics {} at {}:{} to be {} at {}:{}\n\nsource:\n{}\n",
-    diagnostic.code,
+    diagnostic.details.code,
     line_and_column.line_index + 1,
     line_and_column.column_index,
     code,
@@ -378,13 +394,14 @@ fn assert_diagnostic_2(
   fixes: &[LintErrFix],
   text_info: &SourceTextInfo,
 ) {
-  let line_and_column = diagnostic
+  let diagnostic_range = diagnostic.range.as_ref().unwrap();
+  let line_and_column = diagnostic_range
     .text_info
-    .line_and_column_index(diagnostic.range.start);
+    .line_and_column_index(diagnostic_range.range.start);
   assert_eq!(
-    code, diagnostic.code,
+    code, diagnostic.details.code,
     "Rule code is expected to be \"{}\", but got \"{}\"\n\nsource:\n{}\n",
-    code, diagnostic.code, source
+    code, diagnostic.details.code, source
   );
   assert_eq!(
     line,
@@ -400,19 +417,20 @@ fn assert_diagnostic_2(
     col, line_and_column.column_index, source
   );
   assert_eq!(
-    message, &diagnostic.message,
+    message, &diagnostic.details.message,
     "Diagnostic message is expected to be \"{}\", but got \"{}\"\n\nsource:\n{}\n",
-    message, &diagnostic.message, source
+    message, &diagnostic.details.message, source
   );
   assert_eq!(
     hint,
-    diagnostic.hint.as_deref(),
+    diagnostic.details.hint.as_deref(),
     "Diagnostic hint is expected to be \"{:?}\", but got \"{:?}\"\n\nsource:\n{}\n",
     hint,
-    diagnostic.hint.as_deref(),
+    diagnostic.details.hint.as_deref(),
     source
   );
   let actual_fixes = diagnostic
+    .details
     .fixes
     .iter()
     .map(|fix| LintErrFix {
@@ -435,7 +453,7 @@ fn assert_diagnostic_2(
 
 #[track_caller]
 pub fn assert_lint_ok(
-  rule: &'static dyn LintRule,
+  rule: Box<dyn LintRule>,
   source: &str,
   specifier: &'static str,
 ) {
@@ -451,7 +469,7 @@ pub fn assert_lint_ok(
 }
 
 /// Just run the specified lint on the source code to make sure it doesn't panic.
-pub fn assert_lint_not_panic(rule: &'static dyn LintRule, source: &str) {
+pub fn assert_lint_not_panic(rule: Box<dyn LintRule>, source: &str) {
   let _result = lint(rule, source, TEST_FILE_NAME);
 }
 

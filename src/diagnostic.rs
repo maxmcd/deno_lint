@@ -27,10 +27,15 @@ pub struct LintFix {
 }
 
 #[derive(Debug, Clone)]
-pub struct LintDiagnostic {
-  pub specifier: ModuleSpecifier,
-  pub range: SourceRange,
+pub struct LintDiagnosticRange {
   pub text_info: SourceTextInfo,
+  pub range: SourceRange,
+  /// Additional information displayed beside the highlighted range.
+  pub description: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LintDiagnosticDetails {
   pub message: String,
   pub code: String,
   pub hint: Option<String>,
@@ -41,6 +46,22 @@ pub struct LintDiagnostic {
   /// only the first fix will be used for the `--fix` flag, but
   /// multiple will be shown in the LSP.
   pub fixes: Vec<LintFix>,
+  /// URL to the lint rule documentation. By default, the url uses the
+  /// code to link to lint.deno.land
+  pub custom_docs_url: Option<String>,
+  /// Displays additional information at the end of a diagnostic.
+  pub info: Vec<Cow<'static, str>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LintDiagnostic {
+  pub specifier: ModuleSpecifier,
+  /// Optional range within the file.
+  ///
+  /// Diagnostics that don't have a range mean there's something wrong with
+  /// the whole file.
+  pub range: Option<LintDiagnosticRange>,
+  pub details: LintDiagnosticDetails,
 }
 
 impl Diagnostic for LintDiagnostic {
@@ -49,38 +70,47 @@ impl Diagnostic for LintDiagnostic {
   }
 
   fn code(&self) -> Cow<'_, str> {
-    Cow::Borrowed(&self.code)
+    Cow::Borrowed(&self.details.code)
   }
 
   fn message(&self) -> Cow<'_, str> {
-    Cow::Borrowed(&self.message)
+    Cow::Borrowed(&self.details.message)
   }
 
   fn location(&self) -> DiagnosticLocation {
-    DiagnosticLocation::ModulePosition {
-      specifier: Cow::Borrowed(&self.specifier),
-      text_info: Cow::Borrowed(&self.text_info),
-      source_pos: DiagnosticSourcePos::SourcePos(self.range.start),
+    match &self.range {
+      Some(range) => DiagnosticLocation::ModulePosition {
+        specifier: Cow::Borrowed(&self.specifier),
+        text_info: Cow::Borrowed(&range.text_info),
+        source_pos: DiagnosticSourcePos::SourcePos(range.range.start),
+      },
+      None => DiagnosticLocation::Module {
+        specifier: Cow::Borrowed(&self.specifier),
+      },
     }
   }
 
   fn snippet(&self) -> Option<DiagnosticSnippet<'_>> {
-    let range = DiagnosticSourceRange {
-      start: DiagnosticSourcePos::SourcePos(self.range.start),
-      end: DiagnosticSourcePos::SourcePos(self.range.end),
-    };
+    let range = self.range.as_ref()?;
     Some(DiagnosticSnippet {
-      source: Cow::Borrowed(&self.text_info),
-      highlight: DiagnosticSnippetHighlight {
-        range,
+      source: Cow::Borrowed(&range.text_info),
+      highlights: vec![DiagnosticSnippetHighlight {
+        range: DiagnosticSourceRange {
+          start: DiagnosticSourcePos::SourcePos(range.range.start),
+          end: DiagnosticSourcePos::SourcePos(range.range.end),
+        },
         style: DiagnosticSnippetHighlightStyle::Error,
-        description: None,
-      },
+        description: range.description.as_deref().map(Cow::Borrowed),
+      }],
     })
   }
 
   fn hint(&self) -> Option<Cow<'_, str>> {
-    self.hint.as_ref().map(|s| Cow::Borrowed(s.as_str()))
+    self
+      .details
+      .hint
+      .as_ref()
+      .map(|s| Cow::Borrowed(s.as_str()))
   }
 
   fn snippet_fixed(&self) -> Option<DiagnosticSnippet<'_>> {
@@ -88,13 +118,17 @@ impl Diagnostic for LintDiagnostic {
   }
 
   fn info(&self) -> Cow<'_, [std::borrow::Cow<'_, str>]> {
-    Cow::Borrowed(&[])
+    Cow::Borrowed(&self.details.info)
   }
 
   fn docs_url(&self) -> Option<Cow<'_, str>> {
-    Some(Cow::Owned(format!(
-      "https://lint.deno.land/rules/{}",
-      &self.code
-    )))
+    if let Some(custom_docs_url) = &self.details.custom_docs_url {
+      Some(Cow::Borrowed(custom_docs_url))
+    } else {
+      Some(Cow::Owned(format!(
+        "https://lint.deno.land/rules/{}",
+        &self.details.code
+      )))
+    }
   }
 }
