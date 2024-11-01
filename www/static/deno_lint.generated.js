@@ -4,7 +4,7 @@
 // deno-fmt-ignore-file
 /// <reference types="./deno_lint.generated.d.ts" />
 
-// source-hash: 802750396797873dd170e9eed514841969fb4837
+// source-hash: 9d47fce94f444edde5f58d4d9a28945574de7f13
 let wasm;
 
 const cachedTextDecoder = typeof TextDecoder !== "undefined"
@@ -171,6 +171,9 @@ const imports = {
     __wbindgen_string_new: function (arg0, arg1) {
       const ret = getStringFromWasm0(arg0, arg1);
       return addHeapObject(ret);
+    },
+    __wbindgen_throw: function (arg0, arg1) {
+      throw new Error(getStringFromWasm0(arg0, arg1));
     },
   },
 };

@@ -1,10 +1,12 @@
 // Copyright 2020-2023 the Deno authors. All rights reserved. MIT license.
 
 use crate::diagnostic::LintDiagnostic;
+use crate::linter::LintConfig;
 use crate::linter::LintFileOptions;
-use crate::linter::LinterBuilder;
+use crate::linter::Linter;
+use crate::linter::LinterOptions;
 use crate::rules::get_all_rules;
-use crate::rules::get_recommended_rules;
+use crate::rules::recommended_rules;
 use deno_ast::MediaType;
 use deno_ast::ModuleSpecifier;
 use deno_ast::SourceRange;
@@ -23,13 +25,25 @@ pub fn run(
   source_code: String,
   enable_all_rules: bool,
 ) -> Result<String, String> {
-  let linter = LinterBuilder::default()
-    .rules(if enable_all_rules {
-      get_all_rules()
-    } else {
-      get_recommended_rules()
-    })
-    .build();
+  let rules = if enable_all_rules {
+    get_all_rules()
+  } else {
+    recommended_rules(get_all_rules())
+  };
+  let all_rule_codes = if enable_all_rules {
+    get_all_rules()
+  } else {
+    recommended_rules(get_all_rules())
+  };
+  let linter = Linter::new(LinterOptions {
+    rules,
+    all_rule_codes: all_rule_codes
+      .into_iter()
+      .map(|rule| rule.code())
+      .collect(),
+    custom_ignore_diagnostic_directive: None,
+    custom_ignore_file_directive: None,
+  });
   let specifier = ModuleSpecifier::parse(&format!("file:///{filename}"))
     .map_err(|e| e.to_string())?;
   let media_type = MediaType::from_specifier(&specifier);
@@ -38,11 +52,15 @@ pub fn run(
       specifier,
       source_code,
       media_type,
+      config: LintConfig {
+        default_jsx_factory: Some("React.createElement".to_owned()),
+        default_jsx_fragment_factory: Some("React.Fragment".to_owned()),
+      },
     })
     .map_err(|e| e.to_string())?;
   let file_diagnostics = FileDiagnostics {
     filename,
-    text_info: parsed_source.text_info().clone(),
+    text_info: parsed_source.text_info_lazy().clone(),
     diagnostics,
   };
 
@@ -88,19 +106,19 @@ impl std::error::Error for MietteDiagnostic<'_> {}
 
 impl Display for MietteDiagnostic<'_> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    f.write_str(&self.lint_diagnostic.message)
+    f.write_str(&self.lint_diagnostic.details.message)
   }
 }
 
 impl miette::Diagnostic for MietteDiagnostic<'_> {
   fn code<'a>(&'a self) -> Option<Box<dyn Display + 'a>> {
-    Some(Box::new(self.lint_diagnostic.code.to_string()))
+    Some(Box::new(self.lint_diagnostic.details.code.to_string()))
   }
 
   fn help<'a>(&'a self) -> Option<Box<dyn Display + 'a>> {
     Some(Box::new(format!(
       "https://lint.deno.land/#{}",
-      self.lint_diagnostic.code
+      self.lint_diagnostic.details.code
     )))
   }
 
@@ -111,27 +129,18 @@ impl miette::Diagnostic for MietteDiagnostic<'_> {
   fn labels(
     &self,
   ) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
-    let len = self
-      .lint_diagnostic
-      .range
-      .end
-      .as_byte_index(StartSourcePos::START_SOURCE_POS)
-      - self
-        .lint_diagnostic
-        .range
-        .start
-        .as_byte_index(StartSourcePos::START_SOURCE_POS);
+    let range = self.lint_diagnostic.range.as_ref().unwrap().range;
+
+    let len = range.end.as_byte_index(StartSourcePos::START_SOURCE_POS)
+      - range.start.as_byte_index(StartSourcePos::START_SOURCE_POS);
     let start = miette::SourceOffset::from(
-      self
-        .lint_diagnostic
-        .range
-        .start
-        .as_byte_index(StartSourcePos::START_SOURCE_POS),
+      range.start.as_byte_index(StartSourcePos::START_SOURCE_POS),
     );
     let len = miette::SourceOffset::from(len);
     let span = miette::SourceSpan::new(start, len);
     let text = self
       .lint_diagnostic
+      .details
       .hint
       .as_ref()
       .map(|help| help.to_string());
